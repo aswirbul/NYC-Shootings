@@ -1,0 +1,403 @@
+---
+title: "Using Historic Trends to Identify Risk Factors and Predict Future Shooting Incidents in NYC"
+author: "AS"
+date: "2025-04-25"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Importing Data
+
+First, we must import the necessary packages.
+```{r library, message = FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(ggmap)
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(tidyr)
+
+```
+Now let's read in our data.
+```{r import_data, message=FALSE, warning=FALSE}
+raw_shooting_data <- read_csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD") 
+```
+Next, before we perform any analysis, let's view our data and see what may need to be tidied up.
+```{r}
+glimpse(raw_shooting_data)
+
+```
+This shows us that we have 21 columns, each representing a different variable, with 29,722 records.  In addition, we can see that we will need to change some of our variables to a more appropriate type, and that some columns may be missing data or have data entry errors. We will address all of this in the next section.
+
+## Tidying & Transforming Data
+
+Let's first check to see if there are any duplicate entries and remove those if applicable.
+```{r}
+clean_shooting_data <- raw_shooting_data %>% distinct(INCIDENT_KEY, .keep_all = TRUE)
+records_removed = nrow(raw_shooting_data) - nrow(clean_shooting_data)
+
+cat(records_removed, "duplicate records removed.", "\n")
+```
+
+Next, let's remove columns that are unnecessary to our analysis.
+```{r}
+
+clean_shooting_data <- clean_shooting_data %>%
+  select(-c(
+    LOC_OF_OCCUR_DESC, 
+    PRECINCT, 
+    JURISDICTION_CODE, 
+    LOC_CLASSFCTN_DESC, 
+    LOCATION_DESC, 
+    X_COORD_CD, 
+    Y_COORD_CD, 
+    Lon_Lat))
+
+
+```
+
+Next, let's convert each of our variables to the proper type. 
+```{r}
+clean_shooting_data <- clean_shooting_data%>%
+  mutate(
+    INCIDENT_KEY = as.character(INCIDENT_KEY),
+    OCCUR_DATE = mdy(OCCUR_DATE),
+    BORO = as.factor(BORO),
+    PERP_AGE_GROUP = as.factor(PERP_AGE_GROUP),
+    PERP_SEX = as.factor(PERP_SEX),
+    PERP_RACE = as.factor(PERP_RACE),
+    VIC_AGE_GROUP = as.factor(VIC_AGE_GROUP),
+    VIC_SEX = as.factor(VIC_SEX),
+    VIC_RACE = as.factor(VIC_RACE)
+    )
+
+```
+Finally, let's set each factor column to accept an appropriate fixed set of variable, setting any null values or outliers to "NA".  After doing this, we can check how much data is missing in each column.
+```{r}
+clean_shooting_data <- clean_shooting_data %>%
+  mutate(
+    BORO = case_when(
+      BORO %in% c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND") ~ BORO,
+      TRUE ~ NA_character_),
+    BORO = factor(BORO, 
+                            levels = c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND")),
+    PERP_AGE_GROUP = case_when(
+      PERP_AGE_GROUP %in% c("<18", "18-24", "25-44", "45-64", "65+") ~ PERP_AGE_GROUP,
+      TRUE ~ NA_character_),
+    PERP_AGE_GROUP = factor(PERP_AGE_GROUP, 
+                            levels = c("<18", "18-24", "25-44", "45-64", "65+")),
+    PERP_SEX = case_when(
+      PERP_SEX %in% c("F", "M") ~ PERP_SEX,
+      TRUE ~ NA_character_),
+    PERP_SEX = factor(PERP_SEX, 
+                            levels = c("F", "M")),
+    PERP_RACE = case_when(
+      PERP_RACE %in% c("AMERICAN INDIAN/ALASKAN NATIVE", "ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC") ~ PERP_RACE,
+      TRUE ~ NA_character_),
+    PERP_RACE = factor(PERP_RACE, 
+                            levels = c("AMERICAN INDIAN/ALASKAN NATIVE", "ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC")),
+    VIC_AGE_GROUP = case_when(
+      VIC_AGE_GROUP %in% c("<18", "18-24", "25-44", "45-64", "65+") ~ VIC_AGE_GROUP,
+      TRUE ~ NA_character_),
+    VIC_AGE_GROUP = factor(VIC_AGE_GROUP, 
+                            levels = c("<18", "18-24", "25-44", "45-64", "65+")),
+    VIC_SEX = case_when(
+      VIC_SEX %in% c("F", "M") ~ VIC_SEX,
+      TRUE ~ NA_character_),
+    VIC_SEX = factor(VIC_SEX, 
+                            levels = c("F", "M")),
+    VIC_RACE = case_when(
+      VIC_RACE %in% c("AMERICAN INDIAN/ALASKAN NATIVE", "ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC") ~ VIC_RACE,
+      TRUE ~ NA_character_),
+    VIC_RACE = factor(VIC_RACE, 
+                            levels = c("AMERICAN INDIAN/ALASKAN NATIVE", "ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC"))
+    )
+colSums(is.na(clean_shooting_data))
+
+```
+From this summary, we can see that the majority of our missing data is in regards to the perpetrator profile (age group, race sex), which makes a lot of sense.  There are also a few records missing from other columns, but these are likely due to typos or outliers.
+
+## Visualizing & Analyzing Data
+First, let's take a look at the incident rate with regards to time.
+```{r}
+
+clean_shooting_data <- clean_shooting_data %>%
+  rename(FATAL = STATISTICAL_MURDER_FLAG) %>%
+  mutate(
+    FATAL = factor(FATAL, levels = c(FALSE, TRUE),labels = c("Non-fatal", "Fatal")),
+    YEAR = factor(year(OCCUR_DATE)),
+    MONTH = factor(month(OCCUR_DATE, label = TRUE)),
+    DAY = factor(wday(OCCUR_DATE, label = TRUE, abbr = TRUE))
+  )
+
+
+clean_shooting_data %>%
+  ggplot(aes(x = YEAR, fill = FATAL)) +
+  geom_bar(position = "stack") +
+  scale_fill_manual(name = NULL, values = c("Non-fatal" = "slateblue", "Fatal" = "firebrick")) +
+  labs(title = "Shooting Incidents from 2006 to 2024",
+       x = "Year",
+       y = "Total Shooting Incidents") +
+  geom_text(stat = 'count', aes(label = after_stat(count)), vjust = 1.5, 
+            col = "white", size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+       
+```
+
+Now let's look at the rate of incidence by borough.
+
+```{r, warning=FALSE}
+borough_counts <- clean_shooting_data %>%
+  count(BORO, name = "Count") %>%
+  mutate(
+    pct   = Count / sum(Count),
+    label = percent(pct, accuracy = 0.1)     
+  )
+
+ggplot(borough_counts, aes(x = "", y = Count, fill = BORO)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 3,
+    color = "white"
+  ) +
+  labs(title = "Total Shooting Incidents by Borough") +
+  theme_void() +
+  theme(legend.title = element_blank())
+```
+
+Next, let's examine if time of day or time of year is a factor in these shootings.
+```{r, warning=FALSE}
+
+clean_shooting_data %>%
+  mutate(
+    Hour = hour(OCCUR_TIME),
+    BORO = factor(BORO)
+  ) %>%
+  count(BORO, Hour) %>%
+  ggplot(aes(x = Hour, y = BORO, fill = n)) +
+    geom_tile() +
+    scale_fill_viridis_c() +
+    labs(
+      title = "Shootings Heatmap: Hour vs. Borough",
+      y = "Borough",
+      x = "Hour",
+      fill = "Number of Shootings"
+    )
+
+
+clean_shooting_data %>%
+  count(YEAR, MONTH) %>%
+  group_by(MONTH) %>%
+  mutate(average_incidents = mean(n)) %>%
+  ggplot(aes(x = MONTH, y = n, group = YEAR, color = YEAR)) +
+  geom_line() +
+  geom_line(aes(x = MONTH, y = average_incidents), color = "black", size = 1.2, linetype = "dashed") + # Average line
+  labs(title = "Monthly Shooting Incidents Across Years",
+       x = "Month",
+       y = "Number of Shooting Incidents") +
+  theme_minimal()
+
+```
+
+Now let's examine who is a victim of these shootings, in terms of race, age, and sex.
+```{r}
+
+clean_shooting_data %>%
+  filter(!is.na(VIC_RACE)) %>%
+  count(VIC_RACE) %>%
+  mutate(
+    pct = n / sum(n),
+    label = scales::percent(pct)  # Only the percentage
+  ) %>%
+  ggplot(aes(x = "", y = pct, fill = VIC_RACE)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3) +
+  scale_fill_viridis_d(option = "cividis") +
+  labs(title = "Victim Race Distribution") +
+  guides(fill = guide_legend(title = "Victim Race")) +  # <-- this sets the legend title
+  theme_void()
+
+
+
+
+clean_shooting_data %>%
+  filter(!is.na(VIC_AGE_GROUP) & !is.na(VIC_SEX)) %>% 
+  count(VIC_AGE_GROUP, VIC_SEX) %>%
+  ggplot(aes(x = VIC_AGE_GROUP, y = n, fill = VIC_SEX)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("F" = "hotpink", "M" = "steelblue")) +
+  labs(
+    title = "Victim Sex by Age Group",
+    x = "Victim Age Group",
+    y = "Number of Victims",
+    fill = "Sex"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+Now that we know who is most likely to be a victim of these crimes, let's take a closer look at exactly where shooting incidents are most likely to occur.
+```{r, warning=FALSE}
+register_stadiamaps(key = "8ea23de7-67bd-4478-9a98-4967ac04b6a0")
+
+nyc_bb <- c(
+  left   = -74.25909,   # westernmost longitude
+  bottom =  40.477399,  # southernmost latitude
+  right  = -73.700272,  # easternmost longitude
+  top    =  40.917577   # northernmost latitude
+)
+
+nyc_map <- get_stadiamap(
+  bbox    = nyc_bb,
+  maptype = "stamen_toner_lite",
+  zoom    = 12
+)
+
+
+ggmap(nyc_map) +
+  stat_density2d(
+    data       = clean_shooting_data,
+    aes(x = Longitude, y = Latitude, fill = ..level.., alpha = ..level..),
+    geom       = "polygon",
+    contour    = TRUE,
+    n          = 200
+  ) +
+  scale_fill_viridis_c(option = "magma") +
+  scale_alpha(range = c(0.1, 0.6), guide = FALSE) +
+  labs(
+    title = "Shooting Hotspots in NYC",
+    subtitle = "Kernel density (all incidents)"
+  ) +
+  theme_minimal()
+
+```
+
+## Modeling Future Shooting Incidents
+
+Now that we have analyzed historic trends, let's create some predictive models to show the projected number of shooting incidents for the next 5 years.
+```{r}
+
+
+yearly_data <- clean_shooting_data %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  count(YEAR) %>%
+  filter(!is.na(YEAR)) %>%
+  arrange(YEAR)
+
+shooting_ts <- ts(yearly_data$n, start = min(yearly_data$YEAR), frequency = 1)
+
+fit <- auto.arima(shooting_ts)
+
+forecast_5yr <- forecast(fit, h = 5)
+
+autoplot(forecast_5yr) +
+  labs(title = "NYC Shooting Forecast (Next 5 Years)", y = "Projected Incidents") +
+  theme_minimal()
+
+summary(forecast_5yr)
+
+cat("Shooting incidents are expected to increase in NYC over the next 5 years:", forecast_5yr$mean[5] > shooting_ts[length(shooting_ts)], "\n")
+
+# Sum of forecasted mean
+total_mean <- sum(forecast_5yr$mean)
+
+cat("Projected total shootings (next 5 years):", round(total_mean), "\n")
+
+monthly_boro_shootings <- clean_shooting_data %>%
+  mutate(YEAR_MONTH = floor_date(OCCUR_DATE, "month")) %>%
+  count(BORO, YEAR_MONTH)
+```
+
+We can analyze this further, by modeling the number of shooting incidents predicted for each borough.
+
+```{r}
+
+all_months <- seq(min(monthly_boro_shootings$YEAR_MONTH), max(monthly_boro_shootings$YEAR_MONTH), by = "month")
+all_boros <- unique(monthly_boro_shootings$BORO)
+
+full_boro_months <- expand_grid(
+  BORO = all_boros,
+  YEAR_MONTH = all_months
+) %>%
+  left_join(monthly_boro_shootings, by = c("BORO", "YEAR_MONTH")) %>%
+  mutate(n = replace_na(n, 0))
+
+boro_forecasts <- full_boro_months %>%
+  group_by(BORO) %>%
+  group_split() %>%
+  map_dfr(~ {
+    boro_name <- unique(.x$BORO)
+    ts_data <- ts(.x$n, frequency = 12)
+    
+    model <- auto.arima(ts_data)
+    forecasted <- forecast(model, h = 60)
+
+    tibble(
+      BORO = boro_name,
+      YEAR_MONTH = seq(max(.x$YEAR_MONTH) + months(1), by = "month", length.out = 60),
+      predicted_shootings = as.numeric(forecasted$mean)
+    )
+  })
+boro_forecast_combined <- full_boro_months %>%
+  mutate(source = "historical") %>%
+  select(BORO, YEAR_MONTH, predicted_shootings = n, source) %>%
+  bind_rows(
+    boro_forecasts %>%
+      mutate(source = "forecast")
+  )
+boro_forecast_combined %>%
+  ggplot(aes(x = YEAR_MONTH, y = predicted_shootings, color = source)) +
+  geom_line() +
+  facet_wrap(~ BORO, scales = "free_y") +
+  scale_color_manual(values = c("historical" = "black", "forecast" = "firebrick")) +
+  labs(
+    title = "Shooting Forecast by Borough (Next 5 Years)",
+    x = "Year-Month",
+    y = "Number of Shootings",
+    color = "Data Source"
+  ) +
+  theme_minimal()
+
+```
+
+As we can see above, shooting incidents in Brooklyn are expected to decrease over the next five years, while the number of incidents in the Bronx are expected to stay relatively the same.
+
+
+## Conclusions
+#### Temporal Trends
+The number of shooting incidents seems to be declining in the last few years, though there was notably a pandemic spike during 2020-2021. In addition, we can clearly see that shootings follow a seasonal trend, increasing during the summertime (with the average high in July) and decreasing during the winter months (with the average low in February). Similarly,in most of the boroughs (with the exception of Staten Island) we see an increase in the number of shooting incidents at night/early morning.  This trend is particularly prevalent in Brooklyn, suggesting that shooting incidents may be tied to nightlife.
+
+#### Geographic Patterns
+The majority of of shooting incidents occur in Brooklyn and the Bronx, compared to other boroughs. Furthermore, we can see that even within these boroughs shootings are concentrated to specific hotspots. 
+
+#### Demographic Disparities
+The overwhelming majority of shooting victims (72.7%) are black people (this increases to 82% - if including black hispanics). People 25-44 years old, and 18-24 years old are most likely to become victims of a shooting; meanwhile, seniors (65+) are the least likely to become victims of a shooting. Furthermore, across all age groups, men are significantly more likely to be shot than women.
+
+## Potential Biases
+There are many potential biases that could be affecting our analysis.  
+
+#### Reporting and Data Collection Bias
+Not all shooting may be reported or properly recorded, especially in areas with low police presence or where distrust in law enforcement exists. This may lead to inaccurate hotspot identification, and misallocate resources from communities that experience high violence that goes underreported.
+
+#### Classification Biases
+Police data may reflect where policing is most active, not necessarily where crime is most prevalent, which may lead to reinforcing stereotypes or misleading conclusions about who is most affected by these shootings.
+
+#### Missing or Incomplete Data
+There is a large amount of data missing, especially relating to the profile of perpetrators. Additionally, the data is manually input, introducing errors in what is reported or how it may be categorized. This can make analyses based on demographic trends statistically unreliable, especially if outliers and unknowns are not handled properly.
+
+#### Historical Bias
+Although the dataset covers a long time span, crime patterns are not neccesarily representative of past trends. Changes in policing practices or policies may cause shooting incidents to spike or fall drastically, making models and forecasts built on past data potentially unreliable.
